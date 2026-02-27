@@ -1,9 +1,9 @@
 """
 predict.py
 
-Loads trained model artifacts and test features, generates weighted
-ensemble predictions using the same weights that were used during
-threshold optimisation in train.py, and saves a versioned submission CSV.
+Loads trained model artifacts and test features, applies the full-data
+target encoder to the test set, generates weighted ensemble predictions,
+applies optimised thresholds, and saves a versioned submission CSV.
 
 Run from the project root:
     python src/predict.py
@@ -14,6 +14,10 @@ import pandas as pd
 import numpy as np
 import pickle
 from pathlib import Path
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from train import TargetEncoder
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
 
@@ -32,10 +36,7 @@ ID_COL = "ID"
 TARGET_INVERSE = {0: "Low", 1: "Medium", 2: "High"}
 
 
-# ── Threshold application ─────────────────────────────────────────────────────
-
 def apply_thresholds(probs, thresholds):
-    """High checked first (rarest class priority). Mirrors train.py exactly."""
     n = len(probs)
     preds = np.zeros(n, dtype=int)
     for i in range(n):
@@ -47,8 +48,6 @@ def apply_thresholds(probs, thresholds):
             preds[i] = 0
     return preds
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     print("Loading model artifacts...")
@@ -62,10 +61,13 @@ def main():
     best_w_lgb = artifacts["best_w_lgb"]
     best_w_xgb = artifacts["best_w_xgb"]
     oof_f1 = artifacts["oof_f1"]
+    full_te = artifacts.get("full_target_encoder")
+    target_encode_cols = artifacts.get("target_encode_cols", [])
 
-    print(f"  OOF macro F1 from training: {oof_f1:.4f}")
+    print(f"  OOF macro F1: {oof_f1:.4f}")
     print(f"  Ensemble weights: LGB={best_w_lgb:.2f}, XGB={best_w_xgb:.2f}")
     print(f"  Thresholds: { {k: round(v, 3) for k, v in best_thresholds.items()} }")
+    print(f"  Target encoding: {'yes' if full_te else 'no'}")
 
     print("\nLoading test features...")
     test = pd.read_csv(PROCESSED_DIR / "test_features.csv")
@@ -73,12 +75,19 @@ def main():
 
     test_ids = test[ID_COL]
     X_test = test[feature_cols]
-    print(f"  Feature columns aligned: {X_test.shape[1]}")
+
+    # Apply full-data target encoder to test set if present
+    if full_te is not None and target_encode_cols:
+        X_test = full_te.transform(X_test)
+        print(f"  Target encoding applied: {len(target_encode_cols)} cols")
+
+    print(f"  Final feature count: {X_test.shape[1]}")
 
     # Average predictions across folds within each model type
     print("\nGenerating predictions...")
     test_probs_lgb = np.zeros((len(X_test), 3))
     test_probs_xgb = np.zeros((len(X_test), 3))
+    test_probs_cat = np.zeros((len(X_test), 3))
 
     for model in models_lgb:
         test_probs_lgb += model.predict_proba(X_test)
@@ -88,11 +97,15 @@ def main():
         test_probs_xgb += model.predict_proba(X_test)
     test_probs_xgb /= len(models_xgb)
 
-    # Use the exact same weights that were used in threshold optimisation
-    # This is the key consistency fix - thresholds and ensemble weights are locked together
-    test_probs_ensemble = best_w_lgb * test_probs_lgb + best_w_xgb * test_probs_xgb
+    models_cat = artifacts["models_cat"]
+    for model in models_cat:
+        test_probs_cat += model.predict_proba(X_test)
+    test_probs_cat /= len(models_cat)
 
-    # Apply optimised thresholds
+    # Three-model weighted ensemble: CAT=0.3, LGB/XGB split=0.7
+    lgbxgb = best_w_lgb * test_probs_lgb + best_w_xgb * test_probs_xgb
+    test_probs_ensemble = 0.7 * lgbxgb + 0.3 * test_probs_cat
+
     test_preds = apply_thresholds(test_probs_ensemble, best_thresholds)
     test_labels = [TARGET_INVERSE[p] for p in test_preds]
 
@@ -108,11 +121,9 @@ def main():
         pct = count / len(submission) * 100
         print(f"  {label:<8} {count:>5}  ({pct:.1f}%)")
 
-    # Version by OOF score
     output_path = SUBMISSIONS_DIR / f"submission_oof{oof_f1:.4f}.csv"
     submission.to_csv(output_path, index=False)
 
-    # Validate format
     sample = pd.read_csv("data/raw/SampleSubmission.csv")
     assert len(submission) == len(sample), \
         f"Row count mismatch: got {len(submission)}, expected {len(sample)}"

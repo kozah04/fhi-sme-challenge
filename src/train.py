@@ -3,13 +3,14 @@ train.py
 
 Trains an ensemble of LightGBM and XGBoost models using stratified
 k-fold cross-validation. Handles class imbalance via class weights.
-Finds optimal ensemble weights via OOF search. Optimises per-class
-probability thresholds post-prediction to maximise macro F1.
+Applies target encoding inside CV folds to prevent leakage. Finds
+optimal ensemble weights via OOF search. Optimises per-class probability
+thresholds post-prediction to maximise weighted F1.
 
-CatBoost has been removed from the ensemble after consistent underperformance
-(0.768 vs LGB 0.804 and XGB 0.802). Including it was pulling the ensemble
-below either individual model. It is retained as a trained artifact in case
-it improves in future experiments.
+Target encoding is computed on the training fold only and applied to the
+validation fold and test set. This is the correct pattern - computing on
+the full training set would leak validation target information into the
+features, inflating OOF scores and hurting generalisation.
 
 Run from the project root:
     python src/train.py
@@ -49,45 +50,124 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 N_FOLDS = 5
 TARGET_COL = "Target"
 ID_COL = "ID"
-N_CLASSES = 3  # Low=0, Medium=1, High=2
+N_CLASSES = 3
 DROP_COLS = [ID_COL, TARGET_COL]
+
+# Columns to target encode.
+# These are the ordinal-encoded categorical columns where the raw integer
+# (0/1/2 or 0/1/3 for country) carries less information than the actual
+# target distribution for each value.
+# We do NOT target encode binary columns (0/1 only) as they carry little
+# extra information from TE, and we avoid the continuous numeric columns.
+TARGET_ENCODE_COLS = [
+    "country",
+    "has_credit_card",
+    "has_loan_account",
+    "has_internet_banking",
+    "has_debit_card",
+    "motor_vehicle_insurance",
+    "medical_insurance",
+    "funeral_insurance",
+    "has_mobile_money",
+    "uses_friends_family_savings",
+    "uses_informal_lender",
+    "keeps_financial_records",
+    "offers_credit_to_customers",
+    "compliance_income_tax",
+]
+
+
+# ── Target encoding ───────────────────────────────────────────────────────────
+
+class TargetEncoder:
+    """
+    Encodes categorical columns as the mean target value per category,
+    computed on the training fold only.
+
+    For multi-class targets we produce one encoding per class:
+        col_te_0 = P(Target=Low   | col=value)
+        col_te_1 = P(Target=Medium | col=value)
+        col_te_2 = P(Target=High  | col=value)
+
+    Smoothing is applied to shrink rare categories toward the global mean,
+    preventing overfit on categories with very few examples.
+
+    Parameters
+    ----------
+    smoothing : float
+        Controls how much rare categories are shrunk toward the global mean.
+        Higher = more shrinkage. Default 10 works well for this dataset size.
+    """
+
+    def __init__(self, smoothing=10):
+        self.smoothing = smoothing
+        self.encodings_ = {}   # col -> {class -> {value -> encoded_mean}}
+        self.global_means_ = {}  # col -> {class -> global_mean}
+
+    def fit(self, X, y, cols):
+        """Compute target means per category on training data."""
+        self.cols = cols
+        df = X[cols].copy()
+        df["__target__"] = y
+
+        for col in cols:
+            self.encodings_[col] = {}
+            self.global_means_[col] = {}
+
+            for cls in range(N_CLASSES):
+                binary_target = (df["__target__"] == cls).astype(float)
+                global_mean = binary_target.mean()
+                self.global_means_[col][cls] = global_mean
+
+                # Count and mean per category value
+                stats = pd.DataFrame({
+                    "value": df[col],
+                    "target": binary_target,
+                }).groupby("value")["target"].agg(["count", "mean"])
+
+                # Smoothed encoding: blend category mean with global mean
+                # Weight toward category mean as n increases
+                smoothed = (
+                    (stats["count"] * stats["mean"] + self.smoothing * global_mean)
+                    / (stats["count"] + self.smoothing)
+                )
+                self.encodings_[col][cls] = smoothed.to_dict()
+
+        return self
+
+    def transform(self, X):
+        """Apply fitted encoding to a dataframe. Unknown values get global mean."""
+        X_out = X.copy()
+
+        for col in self.cols:
+            for cls in range(N_CLASSES):
+                new_col = f"{col}_te_{cls}"
+                global_mean = self.global_means_[col][cls]
+                encoding_map = self.encodings_[col][cls]
+                X_out[new_col] = X_out[col].map(encoding_map).fillna(global_mean)
+
+        return X_out
+
+    def fit_transform(self, X, y, cols):
+        return self.fit(X, y, cols).transform(X)
 
 
 # ── Class weights ─────────────────────────────────────────────────────────────
 
 def get_class_weights(y):
-    """
-    Compute balanced class weights.
-
-    With Low=65%, Medium=30%, High=5%, an unweighted model will almost
-    entirely ignore the High class. Balanced weights inversely scale each
-    class by its frequency, forcing the model to treat a High error as
-    ~13x more costly than a Low error. This is critical for macro F1.
-    """
     classes = np.array([0, 1, 2])
     weights = compute_class_weight("balanced", classes=classes, y=y)
     return dict(zip(classes, weights))
 
 
 def get_sample_weights(y, class_weight_dict):
-    """Map per-class weights to per-sample weights for XGBoost."""
     return np.array([class_weight_dict[yi] for yi in y])
 
 
 # ── Model definitions ─────────────────────────────────────────────────────────
 
-def make_lgb_model(class_weights):
-    """
-    LightGBM with Optuna-tuned hyperparameters.
-
-    Key changes from defaults:
-    - learning_rate lowered to 0.0209 (wants to learn slowly and carefully)
-    - n_estimators raised to 2000 to match lower learning rate ceiling
-    - colsample_bytree=0.597 (model benefits from feature subsampling,
-      suggests some noise in the feature set)
-    - min_split_gain=0.253 (suppresses noisy splits)
-    Early stopping at 50 rounds controls actual tree count.
-    """
+def make_lgb_model():
+    """LightGBM with Optuna-tuned hyperparameters."""
     return lgb.LGBMClassifier(
         n_estimators=2000,
         learning_rate=0.0209,
@@ -99,7 +179,6 @@ def make_lgb_model(class_weights):
         reg_alpha=0.00055,
         reg_lambda=0.1410,
         min_split_gain=0.2529,
-        class_weight=class_weights,
         random_state=SEED,
         verbose=-1,
         n_jobs=-1,
@@ -107,10 +186,6 @@ def make_lgb_model(class_weights):
 
 
 def make_xgb_model():
-    """
-    XGBoost classifier with sample weights passed at fit time.
-    tree_method='hist' is fastest for CPU.
-    """
     return xgb.XGBClassifier(
         n_estimators=1000,
         learning_rate=0.05,
@@ -129,18 +204,12 @@ def make_xgb_model():
     )
 
 
-def make_cat_model(class_weights):
-    """
-    CatBoost classifier. Trained and saved but excluded from ensemble
-    due to consistent underperformance vs LGB and XGB.
-    """
-    weights_list = [class_weights[i] for i in range(N_CLASSES)]
+def make_cat_model():
     return CatBoostClassifier(
         iterations=1000,
         learning_rate=0.05,
         depth=6,
         l2_leaf_reg=3,
-        class_weights=weights_list,
         random_seed=SEED,
         verbose=0,
         thread_count=-1,
@@ -150,25 +219,15 @@ def make_cat_model(class_weights):
 # ── Threshold optimisation ────────────────────────────────────────────────────
 
 def optimise_thresholds(oof_probs, y_true, n_steps=50):
-    """
-    Find per-class probability thresholds that maximise macro F1.
-
-    The default argmax rule systematically under-predicts rare classes
-    because their probabilities are naturally lower. We search for
-    thresholds that give minority classes priority in the decision.
-
-    Critically: thresholds are optimised on the SAME probability matrix
-    that predict.py will use (the weighted ensemble). This ensures
-    consistency between training and inference.
-    """
     best_thresholds = {0: 0.5, 1: 0.5, 2: 0.5}
     best_f1 = 0.0
     threshold_grid = np.linspace(0.05, 0.95, n_steps)
+    
 
     for t2 in threshold_grid:
         for t1 in threshold_grid:
             preds = apply_thresholds(oof_probs, {0: 0.5, 1: t1, 2: t2})
-            score = f1_score(y_true, preds, average="macro")
+            score = f1_score(y_true, preds, average="weighted")
             if score > best_f1:
                 best_f1 = score
                 best_thresholds = {0: 0.5, 1: t1, 2: t2}
@@ -177,7 +236,6 @@ def optimise_thresholds(oof_probs, y_true, n_steps=50):
 
 
 def apply_thresholds(probs, thresholds):
-    """Apply per-class thresholds. High checked first (rarest class priority)."""
     n = len(probs)
     preds = np.zeros(n, dtype=int)
     for i in range(n):
@@ -193,28 +251,12 @@ def apply_thresholds(probs, thresholds):
 # ── Optimal ensemble weight search ───────────────────────────────────────────
 
 def find_optimal_weights(oof_probs_lgb, oof_probs_xgb, y_true, n_steps=20):
-    """
-    Search for the optimal LGB/XGB weighting via OOF macro F1.
-
-    Rather than guessing weights (e.g. 0.5/0.5), we search over a grid
-    to find the combination that maximises OOF macro F1 after threshold
-    optimisation. This is computed on OOF data so it is not leakage.
-
-    Returns
-    -------
-    best_w_lgb : float  (weight for LGB, XGB weight = 1 - best_w_lgb)
-    best_f1 : float
-    best_thresholds : dict
-    best_ensemble_probs : np.ndarray
-    """
     best_w_lgb = 0.5
     best_f1 = 0.0
     best_thresholds = {0: 0.5, 1: 0.5, 2: 0.5}
     best_ensemble_probs = None
 
-    weight_grid = np.linspace(0.3, 0.8, n_steps)
-
-    for w_lgb in weight_grid:
+    for w_lgb in np.linspace(0.3, 0.8, n_steps):
         w_xgb = 1.0 - w_lgb
         ensemble = w_lgb * oof_probs_lgb + w_xgb * oof_probs_xgb
         thresholds, f1 = optimise_thresholds(ensemble, y_true, n_steps=30)
@@ -262,11 +304,16 @@ def fit_cat(model, X_tr, y_tr, X_val, y_val):
 
 def run_cv(X, y, class_weights):
     """
-    Run stratified k-fold CV for LightGBM, XGBoost, and CatBoost.
+    Run stratified k-fold CV with target encoding applied inside each fold.
 
-    All three model OOF probs are saved separately so ensemble weights
-    can be searched post-training. CatBoost is trained for completeness
-    but excluded from the primary ensemble.
+    For each fold:
+    1. Fit TargetEncoder on training portion only
+    2. Transform training and validation portions
+    3. Train LGB, XGB, CatBoost on transformed features
+    4. Collect OOF probabilities on the validation fold
+
+    The fitted encoders from each fold are saved so predict.py can apply
+    the full-data encoder (fitted on all training data) to the test set.
     """
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
@@ -280,32 +327,39 @@ def run_cv(X, y, class_weights):
     for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
         print(f"\n  Fold {fold + 1}/{N_FOLDS}")
 
-        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_tr, y_val = y[train_idx], y[val_idx]
+        X_tr_raw = X.iloc[train_idx].copy()
+        X_val_raw = X.iloc[val_idx].copy()
+        y_tr = y[train_idx]
+        y_val = y[val_idx]
         sw_tr = sample_weights_full[train_idx]
 
+        # Fit target encoder on training fold, apply to both
+        te = TargetEncoder(smoothing=10)
+        X_tr = te.fit_transform(X_tr_raw, y_tr, TARGET_ENCODE_COLS)
+        X_val = te.transform(X_val_raw)
+
         # LightGBM
-        lgb_model = make_lgb_model(class_weights)
+        lgb_model = make_lgb_model()
         lgb_model = fit_lgb(lgb_model, X_tr, y_tr, X_val, y_val)
         oof_probs_lgb[val_idx] = lgb_model.predict_proba(X_val)
         models_lgb.append(lgb_model)
-        lgb_f1 = f1_score(y_val, lgb_model.predict(X_val), average="macro")
+        lgb_f1 = f1_score(y_val, lgb_model.predict(X_val), average="weighted")
         print(f"    LGB  F1: {lgb_f1:.4f} | best iter: {lgb_model.best_iteration_}")
 
         # XGBoost
         xgb_model = make_xgb_model()
-        xgb_model = fit_xgb(xgb_model, X_tr, y_tr, X_val, y_val, sample_weight=sw_tr)
+        xgb_model = fit_xgb(xgb_model, X_tr, y_tr, X_val, y_val, sample_weight=None)
         oof_probs_xgb[val_idx] = xgb_model.predict_proba(X_val)
         models_xgb.append(xgb_model)
-        xgb_f1 = f1_score(y_val, xgb_model.predict(X_val), average="macro")
+        xgb_f1 = f1_score(y_val, xgb_model.predict(X_val), average="weighted")
         print(f"    XGB  F1: {xgb_f1:.4f}")
 
-        # CatBoost (trained but not used in primary ensemble)
-        cat_model = make_cat_model(class_weights)
+        # CatBoost
+        cat_model = make_cat_model()
         cat_model = fit_cat(cat_model, X_tr, y_tr, X_val, y_val)
         oof_probs_cat[val_idx] = cat_model.predict_proba(X_val)
         models_cat.append(cat_model)
-        cat_f1 = f1_score(y_val, cat_model.predict(X_val), average="macro")
+        cat_f1 = f1_score(y_val, cat_model.predict(X_val), average="weighted")
         print(f"    CAT  F1: {cat_f1:.4f} | best iter: {cat_model.best_iteration_}")
 
     return (
@@ -316,18 +370,18 @@ def run_cv(X, y, class_weights):
 
 # ── Feature importance ────────────────────────────────────────────────────────
 
-def print_feature_importance(models_lgb, feature_names, top_n=20):
-    importances = np.zeros(len(feature_names))
-    for model in models_lgb:
-        importances += model.feature_importances_
-    importances /= len(models_lgb)
+def print_feature_importance(models_lgb, top_n=20):
+    """Print feature importance from the first fold (representative)."""
+    model = models_lgb[0]
+    importances = model.feature_importances_
+    feature_names = model.feature_name_
 
     importance_df = pd.DataFrame({
         "feature": feature_names,
         "importance": importances,
     }).sort_values("importance", ascending=False)
 
-    print(f"\nTop {top_n} features (LightGBM average importance):")
+    print(f"\nTop {top_n} features (LightGBM fold 1 importance):")
     for _, row in importance_df.head(top_n).iterrows():
         print(f"  {row['feature']:<45} {row['importance']:.1f}")
 
@@ -337,59 +391,65 @@ def print_feature_importance(models_lgb, feature_names, top_n=20):
 def main():
     print("Loading feature data...")
     train = pd.read_csv(PROCESSED_DIR / "train_features.csv")
-    print(f"  Shape: {train.shape}")
+    test = pd.read_csv(PROCESSED_DIR / "test_features.csv")
+    print(f"  Train: {train.shape}, Test: {test.shape}")
 
     feature_cols = [c for c in train.columns if c not in DROP_COLS]
     X = train[feature_cols]
     y = train[TARGET_COL].values
+    X_test = test[feature_cols]
 
     print(f"  Features: {len(feature_cols)}")
     print(f"  Target distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
+    print(f"  Target encoding: {len(TARGET_ENCODE_COLS)} cols x {N_CLASSES} classes "
+          f"= {len(TARGET_ENCODE_COLS) * N_CLASSES} new features")
 
     class_weights = get_class_weights(y)
     print(f"\nClass weights: { {k: round(v, 3) for k, v in class_weights.items()} }")
-    print("  (0=Low, 1=Medium, 2=High)")
 
-    print(f"\nRunning {N_FOLDS}-fold stratified CV...")
+    print(f"\nRunning {N_FOLDS}-fold stratified CV with target encoding...")
     (
         oof_probs_lgb, oof_probs_xgb, oof_probs_cat,
         models_lgb, models_xgb, models_cat,
     ) = run_cv(X, y, class_weights)
 
-    # Per-model OOF scores
     print("\n" + "=" * 50)
-    print("Per-model OOF macro F1 (argmax, no threshold optimisation):")
+    print("Per-model OOF weighted F1 (argmax):")
     for name, probs in [
         ("LightGBM", oof_probs_lgb),
         ("XGBoost ", oof_probs_xgb),
         ("CatBoost", oof_probs_cat),
     ]:
         preds = np.argmax(probs, axis=1)
-        score = f1_score(y, preds, average="macro")
+        score = f1_score(y, preds, average="weighted")
         print(f"  {name}  {score:.4f}")
 
-    # Find optimal LGB/XGB ensemble weights on OOF
     print("\nSearching for optimal LGB/XGB ensemble weights...")
     best_w_lgb, best_f1, best_thresholds, best_ensemble_probs = find_optimal_weights(
         oof_probs_lgb, oof_probs_xgb, y
     )
     best_w_xgb = 1.0 - best_w_lgb
-
     print(f"  Best weights: LGB={best_w_lgb:.2f}, XGB={best_w_xgb:.2f}")
     print(f"  Best thresholds: { {k: round(v, 3) for k, v in best_thresholds.items()} }")
-    print(f"  Best OOF macro F1: {best_f1:.4f}")
+    print(f"  Best OOF weighted F1: {best_f1:.4f}")
 
-    print_feature_importance(models_lgb, feature_cols)
+    print_feature_importance(models_lgb)
 
-    # Save all artifacts
-    # best_ensemble_probs and best_thresholds are consistent with each other
-    # predict.py will use the same weights to build test ensemble probs
-    print("\nSaving models and metadata...")
+    # Fit a full-data target encoder for transforming the test set.
+    # This uses all training data (no fold split) to get the most stable
+    # encoding estimates for the test set.
+    print("\nFitting full-data target encoder for test set...")
+    full_te = TargetEncoder(smoothing=10)
+    full_te.fit(X, y, TARGET_ENCODE_COLS)
+
+    print("Saving models and metadata...")
     artifacts = {
         "models_lgb": models_lgb,
         "models_xgb": models_xgb,
         "models_cat": models_cat,
         "feature_cols": feature_cols,
+        "target_encode_cols": TARGET_ENCODE_COLS,
+        "full_target_encoder": full_te,
         "best_thresholds": best_thresholds,
         "best_w_lgb": best_w_lgb,
         "best_w_xgb": best_w_xgb,
@@ -404,7 +464,7 @@ def main():
         pickle.dump(artifacts, f)
 
     print(f"  Saved models/artifacts.pkl")
-    print(f"\nFinal OOF macro F1: {best_f1:.4f}")
+    print(f"\nFinal OOF weighted F1: {best_f1:.4f}")
 
 
 if __name__ == "__main__":
