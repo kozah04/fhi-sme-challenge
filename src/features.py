@@ -301,7 +301,7 @@ def make_business_features(df):
     df["owner_age_band"] = pd.cut(
         df["owner_age"],
         bins=[0, 25, 35, 45, 55, 120],
-        labels=[0, 1, 2, 3, 4]
+        labels=False
     ).astype(float)
 
     # Marketing reach: word of mouth marketing = community-embedded business
