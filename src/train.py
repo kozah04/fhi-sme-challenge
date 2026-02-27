@@ -1,15 +1,21 @@
 """
 train.py
 
-Trains an ensemble of LightGBM, XGBoost, and CatBoost models using
-stratified k-fold cross-validation. Handles class imbalance via class
-weights. Optimizes per-class probability thresholds post-prediction to
-maximise macro F1. Saves out-of-fold predictions and trained models.
+Trains an ensemble of LightGBM and XGBoost models using stratified
+k-fold cross-validation. Handles class imbalance via class weights.
+Finds optimal ensemble weights via OOF search. Optimises per-class
+probability thresholds post-prediction to maximise macro F1.
+
+CatBoost has been removed from the ensemble after consistent underperformance
+(0.768 vs LGB 0.804 and XGB 0.802). Including it was pulling the ensemble
+below either individual model. It is retained as a trained artifact in case
+it improves in future experiments.
 
 Run from the project root:
     python src/train.py
 """
 
+import random
 import pandas as pd
 import numpy as np
 import pickle
@@ -26,6 +32,12 @@ from catboost import CatBoostClassifier
 
 warnings.filterwarnings("ignore")
 
+# ── Reproducibility ───────────────────────────────────────────────────────────
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 PROCESSED_DIR = Path("data/processed")
@@ -34,13 +46,10 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SEED = 42
 N_FOLDS = 5
 TARGET_COL = "Target"
 ID_COL = "ID"
 N_CLASSES = 3  # Low=0, Medium=1, High=2
-
-# Columns to drop before training - not features
 DROP_COLS = [ID_COL, TARGET_COL]
 
 
@@ -69,25 +78,27 @@ def get_sample_weights(y, class_weight_dict):
 
 def make_lgb_model(class_weights):
     """
-    LightGBM classifier.
+    LightGBM with Optuna-tuned hyperparameters.
 
-    Key decisions:
-    - class_weight param accepts a dict directly
-    - num_leaves=63 gives good depth without overfitting on this data size
-    - min_child_samples=20 prevents tiny leaf nodes
-    - colsample_bytree=0.8 adds feature randomness for better generalisation
-    - verbose=-1 suppresses per-iteration output
+    Key changes from defaults:
+    - learning_rate lowered to 0.0209 (wants to learn slowly and carefully)
+    - n_estimators raised to 2000 to match lower learning rate ceiling
+    - colsample_bytree=0.597 (model benefits from feature subsampling,
+      suggests some noise in the feature set)
+    - min_split_gain=0.253 (suppresses noisy splits)
+    Early stopping at 50 rounds controls actual tree count.
     """
     return lgb.LGBMClassifier(
-        n_estimators=1000,
-        learning_rate=0.05,
-        num_leaves=63,
-        max_depth=-1,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
+        n_estimators=2000,
+        learning_rate=0.0209,
+        num_leaves=76,
+        max_depth=11,
+        min_child_samples=13,
+        subsample=0.7987,
+        colsample_bytree=0.5972,
+        reg_alpha=0.00055,
+        reg_lambda=0.1410,
+        min_split_gain=0.2529,
         class_weight=class_weights,
         random_state=SEED,
         verbose=-1,
@@ -97,12 +108,8 @@ def make_lgb_model(class_weights):
 
 def make_xgb_model():
     """
-    XGBoost classifier.
-
-    XGBoost does not accept a class_weight dict directly for multi-class.
-    We pass sample_weight per-sample during fit() instead.
-    - tree_method='hist' is fastest for CPU
-    - eval_metric='mlogloss' for multi-class
+    XGBoost classifier with sample weights passed at fit time.
+    tree_method='hist' is fastest for CPU.
     """
     return xgb.XGBClassifier(
         n_estimators=1000,
@@ -124,13 +131,8 @@ def make_xgb_model():
 
 def make_cat_model(class_weights):
     """
-    CatBoost classifier.
-
-    CatBoost handles missing values natively, which matters here since
-    we have significant missingness even after adding flags.
-    - class_weights param accepts a list ordered by class index
-    - verbose=0 suppresses output
-    - early_stopping_rounds handled manually via eval_set
+    CatBoost classifier. Trained and saved but excluded from ensemble
+    due to consistent underperformance vs LGB and XGB.
     """
     weights_list = [class_weights[i] for i in range(N_CLASSES)]
     return CatBoostClassifier(
@@ -151,39 +153,18 @@ def optimise_thresholds(oof_probs, y_true, n_steps=50):
     """
     Find per-class probability thresholds that maximise macro F1.
 
-    The default decision rule is argmax(probabilities), which picks the
-    class with the highest probability. But this systematically under-predicts
-    rare classes because their probabilities are naturally lower even when
-    the model is confident about them.
+    The default argmax rule systematically under-predicts rare classes
+    because their probabilities are naturally lower. We search for
+    thresholds that give minority classes priority in the decision.
 
-    We search for thresholds t0, t1, t2 such that:
-        predict High   if P(High) >= t2
-        predict Medium if P(Medium) >= t1
-        predict Low    otherwise
-
-    The search applies thresholds in order of class rarity (rarest first)
-    to give minority classes priority in the decision.
-
-    Parameters
-    ----------
-    oof_probs : np.ndarray of shape (n_samples, 3)
-        Out-of-fold predicted probabilities.
-    y_true : np.ndarray
-        True labels.
-    n_steps : int
-        Number of threshold values to try per class.
-
-    Returns
-    -------
-    best_thresholds : dict {class_index: threshold}
-    best_f1 : float
+    Critically: thresholds are optimised on the SAME probability matrix
+    that predict.py will use (the weighted ensemble). This ensures
+    consistency between training and inference.
     """
     best_thresholds = {0: 0.5, 1: 0.5, 2: 0.5}
     best_f1 = 0.0
-
     threshold_grid = np.linspace(0.05, 0.95, n_steps)
 
-    # Search over High threshold first (most impactful for minority class)
     for t2 in threshold_grid:
         for t1 in threshold_grid:
             preds = apply_thresholds(oof_probs, {0: 0.5, 1: t1, 2: t2})
@@ -196,30 +177,59 @@ def optimise_thresholds(oof_probs, y_true, n_steps=50):
 
 
 def apply_thresholds(probs, thresholds):
-    """
-    Apply per-class thresholds to probability matrix.
-
-    Decision order: High first, then Medium, then Low as default.
-    This gives the rarest class first priority.
-    """
+    """Apply per-class thresholds. High checked first (rarest class priority)."""
     n = len(probs)
-    preds = np.zeros(n, dtype=int)  # default: Low
-
+    preds = np.zeros(n, dtype=int)
     for i in range(n):
         if probs[i, 2] >= thresholds[2]:
-            preds[i] = 2  # High
+            preds[i] = 2
         elif probs[i, 1] >= thresholds[1]:
-            preds[i] = 1  # Medium
+            preds[i] = 1
         else:
-            preds[i] = 0  # Low
-
+            preds[i] = 0
     return preds
 
 
-# ── Early stopping callback ───────────────────────────────────────────────────
+# ── Optimal ensemble weight search ───────────────────────────────────────────
 
-def fit_with_early_stopping_lgb(model, X_tr, y_tr, X_val, y_val):
-    """Fit LGB with early stopping on validation set."""
+def find_optimal_weights(oof_probs_lgb, oof_probs_xgb, y_true, n_steps=20):
+    """
+    Search for the optimal LGB/XGB weighting via OOF macro F1.
+
+    Rather than guessing weights (e.g. 0.5/0.5), we search over a grid
+    to find the combination that maximises OOF macro F1 after threshold
+    optimisation. This is computed on OOF data so it is not leakage.
+
+    Returns
+    -------
+    best_w_lgb : float  (weight for LGB, XGB weight = 1 - best_w_lgb)
+    best_f1 : float
+    best_thresholds : dict
+    best_ensemble_probs : np.ndarray
+    """
+    best_w_lgb = 0.5
+    best_f1 = 0.0
+    best_thresholds = {0: 0.5, 1: 0.5, 2: 0.5}
+    best_ensemble_probs = None
+
+    weight_grid = np.linspace(0.3, 0.8, n_steps)
+
+    for w_lgb in weight_grid:
+        w_xgb = 1.0 - w_lgb
+        ensemble = w_lgb * oof_probs_lgb + w_xgb * oof_probs_xgb
+        thresholds, f1 = optimise_thresholds(ensemble, y_true, n_steps=30)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_w_lgb = w_lgb
+            best_thresholds = thresholds
+            best_ensemble_probs = ensemble
+
+    return best_w_lgb, best_f1, best_thresholds, best_ensemble_probs
+
+
+# ── Early stopping fit functions ─────────────────────────────────────────────
+
+def fit_lgb(model, X_tr, y_tr, X_val, y_val):
     model.fit(
         X_tr, y_tr,
         eval_set=[(X_val, y_val)],
@@ -228,8 +238,7 @@ def fit_with_early_stopping_lgb(model, X_tr, y_tr, X_val, y_val):
     return model
 
 
-def fit_with_early_stopping_xgb(model, X_tr, y_tr, X_val, y_val, sample_weight):
-    """Fit XGB with early stopping on validation set."""
+def fit_xgb(model, X_tr, y_tr, X_val, y_val, sample_weight):
     model.fit(
         X_tr, y_tr,
         sample_weight=sample_weight,
@@ -239,8 +248,7 @@ def fit_with_early_stopping_xgb(model, X_tr, y_tr, X_val, y_val, sample_weight):
     return model
 
 
-def fit_with_early_stopping_cat(model, X_tr, y_tr, X_val, y_val):
-    """Fit CatBoost with early stopping on validation set."""
+def fit_cat(model, X_tr, y_tr, X_val, y_val):
     model.fit(
         X_tr, y_tr,
         eval_set=(X_val, y_val),
@@ -254,21 +262,11 @@ def fit_with_early_stopping_cat(model, X_tr, y_tr, X_val, y_val):
 
 def run_cv(X, y, class_weights):
     """
-    Run stratified k-fold cross-validation for all three models.
+    Run stratified k-fold CV for LightGBM, XGBoost, and CatBoost.
 
-    For each fold:
-    - Train LightGBM, XGBoost, CatBoost with early stopping
-    - Collect out-of-fold probability predictions from each model
-    - Average the three probability matrices (simple ensemble)
-
-    Returns
-    -------
-    oof_probs_lgb, oof_probs_xgb, oof_probs_cat : np.ndarray (n, 3)
-        Per-model out-of-fold probabilities.
-    oof_probs_ensemble : np.ndarray (n, 3)
-        Averaged ensemble probabilities.
-    models_lgb, models_xgb, models_cat : list
-        Trained model objects from each fold (used for test prediction).
+    All three model OOF probs are saved separately so ensemble weights
+    can be searched post-training. CatBoost is trained for completeness
+    but excluded from the primary ensemble.
     """
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
@@ -277,7 +275,6 @@ def run_cv(X, y, class_weights):
     oof_probs_cat = np.zeros((len(X), N_CLASSES))
 
     models_lgb, models_xgb, models_cat = [], [], []
-
     sample_weights_full = get_sample_weights(y, class_weights)
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
@@ -287,41 +284,32 @@ def run_cv(X, y, class_weights):
         y_tr, y_val = y[train_idx], y[val_idx]
         sw_tr = sample_weights_full[train_idx]
 
-        # ── LightGBM ──
+        # LightGBM
         lgb_model = make_lgb_model(class_weights)
-        lgb_model = fit_with_early_stopping_lgb(lgb_model, X_tr, y_tr, X_val, y_val)
+        lgb_model = fit_lgb(lgb_model, X_tr, y_tr, X_val, y_val)
         oof_probs_lgb[val_idx] = lgb_model.predict_proba(X_val)
         models_lgb.append(lgb_model)
-
         lgb_f1 = f1_score(y_val, lgb_model.predict(X_val), average="macro")
         print(f"    LGB  F1: {lgb_f1:.4f} | best iter: {lgb_model.best_iteration_}")
 
-        # ── XGBoost ──
+        # XGBoost
         xgb_model = make_xgb_model()
-        xgb_model = fit_with_early_stopping_xgb(
-            xgb_model, X_tr, y_tr, X_val, y_val, sample_weight=sw_tr
-        )
+        xgb_model = fit_xgb(xgb_model, X_tr, y_tr, X_val, y_val, sample_weight=sw_tr)
         oof_probs_xgb[val_idx] = xgb_model.predict_proba(X_val)
         models_xgb.append(xgb_model)
-
         xgb_f1 = f1_score(y_val, xgb_model.predict(X_val), average="macro")
         print(f"    XGB  F1: {xgb_f1:.4f}")
 
-        # ── CatBoost ──
+        # CatBoost (trained but not used in primary ensemble)
         cat_model = make_cat_model(class_weights)
-        cat_model = fit_with_early_stopping_cat(cat_model, X_tr, y_tr, X_val, y_val)
+        cat_model = fit_cat(cat_model, X_tr, y_tr, X_val, y_val)
         oof_probs_cat[val_idx] = cat_model.predict_proba(X_val)
         models_cat.append(cat_model)
-
         cat_f1 = f1_score(y_val, cat_model.predict(X_val), average="macro")
         print(f"    CAT  F1: {cat_f1:.4f} | best iter: {cat_model.best_iteration_}")
 
-    # Simple average ensemble
-    oof_probs_ensemble = (oof_probs_lgb + oof_probs_xgb + oof_probs_cat) / 3.0
-
     return (
         oof_probs_lgb, oof_probs_xgb, oof_probs_cat,
-        oof_probs_ensemble,
         models_lgb, models_xgb, models_cat,
     )
 
@@ -329,7 +317,6 @@ def run_cv(X, y, class_weights):
 # ── Feature importance ────────────────────────────────────────────────────────
 
 def print_feature_importance(models_lgb, feature_names, top_n=20):
-    """Print average feature importance across LGB folds."""
     importances = np.zeros(len(feature_names))
     for model in models_lgb:
         importances += model.feature_importances_
@@ -352,7 +339,6 @@ def main():
     train = pd.read_csv(PROCESSED_DIR / "train_features.csv")
     print(f"  Shape: {train.shape}")
 
-    # Separate features and target
     feature_cols = [c for c in train.columns if c not in DROP_COLS]
     X = train[feature_cols]
     y = train[TARGET_COL].values
@@ -360,43 +346,44 @@ def main():
     print(f"  Features: {len(feature_cols)}")
     print(f"  Target distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
 
-    # Class weights
     class_weights = get_class_weights(y)
     print(f"\nClass weights: { {k: round(v, 3) for k, v in class_weights.items()} }")
     print("  (0=Low, 1=Medium, 2=High)")
 
-    # Run cross-validation
     print(f"\nRunning {N_FOLDS}-fold stratified CV...")
     (
         oof_probs_lgb, oof_probs_xgb, oof_probs_cat,
-        oof_probs_ensemble,
         models_lgb, models_xgb, models_cat,
     ) = run_cv(X, y, class_weights)
 
     # Per-model OOF scores
     print("\n" + "=" * 50)
-    print("OOF Results (before threshold optimisation):")
-
+    print("Per-model OOF macro F1 (argmax, no threshold optimisation):")
     for name, probs in [
-        ("LightGBM ", oof_probs_lgb),
-        ("XGBoost  ", oof_probs_xgb),
-        ("CatBoost ", oof_probs_cat),
-        ("Ensemble ", oof_probs_ensemble),
+        ("LightGBM", oof_probs_lgb),
+        ("XGBoost ", oof_probs_xgb),
+        ("CatBoost", oof_probs_cat),
     ]:
         preds = np.argmax(probs, axis=1)
         score = f1_score(y, preds, average="macro")
-        print(f"  {name} macro F1: {score:.4f}")
+        print(f"  {name}  {score:.4f}")
 
-    # Threshold optimisation on ensemble OOF
-    print("\nOptimising thresholds on ensemble OOF predictions...")
-    best_thresholds, best_f1 = optimise_thresholds(oof_probs_ensemble, y)
+    # Find optimal LGB/XGB ensemble weights on OOF
+    print("\nSearching for optimal LGB/XGB ensemble weights...")
+    best_w_lgb, best_f1, best_thresholds, best_ensemble_probs = find_optimal_weights(
+        oof_probs_lgb, oof_probs_xgb, y
+    )
+    best_w_xgb = 1.0 - best_w_lgb
+
+    print(f"  Best weights: LGB={best_w_lgb:.2f}, XGB={best_w_xgb:.2f}")
     print(f"  Best thresholds: { {k: round(v, 3) for k, v in best_thresholds.items()} }")
-    print(f"  Best OOF macro F1 after threshold optimisation: {best_f1:.4f}")
+    print(f"  Best OOF macro F1: {best_f1:.4f}")
 
-    # Feature importance
     print_feature_importance(models_lgb, feature_cols)
 
-    # Save everything needed for predict.py
+    # Save all artifacts
+    # best_ensemble_probs and best_thresholds are consistent with each other
+    # predict.py will use the same weights to build test ensemble probs
     print("\nSaving models and metadata...")
     artifacts = {
         "models_lgb": models_lgb,
@@ -404,7 +391,12 @@ def main():
         "models_cat": models_cat,
         "feature_cols": feature_cols,
         "best_thresholds": best_thresholds,
-        "oof_probs_ensemble": oof_probs_ensemble,
+        "best_w_lgb": best_w_lgb,
+        "best_w_xgb": best_w_xgb,
+        "oof_probs_lgb": oof_probs_lgb,
+        "oof_probs_xgb": oof_probs_xgb,
+        "oof_probs_cat": oof_probs_cat,
+        "oof_probs_ensemble": best_ensemble_probs,
         "oof_f1": best_f1,
     }
 
