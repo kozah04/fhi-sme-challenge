@@ -293,6 +293,22 @@ def clean(df, is_train=True):
     for col in NUMERIC_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Targeted imputation of key categorical columns.
+    #
+    # For financial product columns (PRODUCT_COLS), NaN almost certainly means
+    # "Never had" in survey context. If a respondent currently had insurance or
+    # internet banking, they would have answered. Silence implies absence.
+    # We impute with 0 (Never had) so the model can use these columns and the
+    # interaction features that depend on them - which we know from diagnostic
+    # analysis are the strongest signals for predicting High.
+    #
+    # has_insurance is a binary flag. NaN imputed to 0 for the same reason.
+    #
+    # We deliberately do NOT impute attitude/perception columns because those
+    # reflect genuine uncertainty about owner beliefs, not survey non-response.
+    df[PRODUCT_COLS] = df[PRODUCT_COLS].fillna(0)
+    df["has_insurance"] = df["has_insurance"].fillna(0)
+
     return df
 
 
