@@ -64,7 +64,6 @@ TERNARY_COLS = [
     "perception_cannot_afford_insurance",
     "perception_insurance_companies_dont_insure_businesses_like_yours",
     "perception_insurance_important",
-    "compliance_income_tax",
     "current_problem_cash_flow",
 ]
 
@@ -168,11 +167,9 @@ def encode_ternary_col(series, col_name):
 
 def encode_keeps_financial_records(series):
     """
-    keeps_financial_records has a four-level ordinal structure:
-    Yes, always > Yes, sometimes > Yes > No
-
-    We encode this as 3/2/1/0 to preserve the ordinal information.
-    The distinction between 'always' and 'sometimes' matters for financial health.
+    keeps_financial_records ordinal by target rate:
+    Yes,always=3 (15.3% High), Yes=2 (7.1% High), 
+    Yes,sometimes=1 (4.8% High), No=0 (2.0% High)
     """
     def _encode(val):
         v = normalise_string(val)
@@ -180,14 +177,13 @@ def encode_keeps_financial_records(series):
             return np.nan
         if "always" in v:
             return 3
-        if "sometimes" in v:
-            return 2
         if v == "yes":
+            return 2
+        if "sometimes" in v:
             return 1
         if v == "no":
             return 0
         return np.nan
-
     return series.apply(_encode)
 
 
@@ -207,7 +203,26 @@ def encode_offers_credit(series):
         if v == "no":
             return 0
         return np.nan
+    return series.apply(_encode)
 
+
+def encode_compliance_income_tax(series):
+    """
+    compliance_income_tax has strong ordinal signal:
+    Yes=2 (16.8% High), No=1 (3.2% High), Don't know/Refused=0 (1.8%/0% High)
+    Treating Don't know as missing destroys 352 rows of signal.
+    """
+    def _encode(val):
+        v = normalise_string(val)
+        if pd.isna(v):
+            return np.nan
+        if v == "yes":
+            return 2
+        if v == "no":
+            return 1
+        if "don" in v or "know" in v or "refused" in v:
+            return 0
+        return np.nan
     return series.apply(_encode)
 
 
@@ -287,6 +302,7 @@ def clean(df, is_train=True):
     # Special ordinal columns
     df["keeps_financial_records"] = encode_keeps_financial_records(df["keeps_financial_records"])
     df["offers_credit_to_customers"] = encode_offers_credit(df["offers_credit_to_customers"])
+    df["compliance_income_tax"] = encode_compliance_income_tax(df["compliance_income_tax"])
     df["owner_sex"] = encode_owner_sex(df["owner_sex"])
 
     # Numeric columns: coerce to float (handles any stray strings)
