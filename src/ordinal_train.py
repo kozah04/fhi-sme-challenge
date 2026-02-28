@@ -469,6 +469,13 @@ def main():
         "best_tB": best_tB,
         "oof_f1": best_f1,
         "fast_mode": args.fast,
+        # OOF probabilities saved for post-hoc weight search
+        "oof_A_lgb": oof_A_lgb,
+        "oof_A_xgb": oof_A_xgb,
+        "oof_A_cat": oof_A_cat,
+        "oof_B_lgb": oof_B_lgb,
+        "oof_B_xgb": oof_B_xgb,
+        "oof_B_cat": oof_B_cat,
     }
 
     out_path = MODELS_DIR / "ordinal_artifacts.pkl"
