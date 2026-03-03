@@ -233,7 +233,7 @@ def encode_country(series):
     Also keep as a categorical integer for embedding-style use in trees.
 
     We use a simple integer map here. Target encoding is done inside CV
-    folds in train.py to prevent leakage.
+    folds in the training script to prevent leakage.
     """
     country_map = {
         "eswatini": 3,

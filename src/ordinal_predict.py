@@ -20,7 +20,11 @@ import pandas as pd
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train import TargetEncoder
+import target_encoding as target_encoding_module
+
+# Backward compatibility for previously pickled artifacts that reference train.TargetEncoder.
+sys.modules.setdefault("train", target_encoding_module)
+from target_encoding import TargetEncoder  # noqa: F401
 
 SEED = 42
 random.seed(SEED)

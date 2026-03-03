@@ -15,7 +15,7 @@ Decision rule at inference:
 This enforces the ordinal structure (Low → Medium → High) rather than
 treating the three classes as unrelated categories.
 
-Key differences from train.py:
+Key properties of this ordinal pipeline:
   - Two binary tasks instead of one multiclass task
   - Joint country+target CV stratification key (tighter OOF/LB alignment)
   - Proper 3-way ensemble weight search across LGB/XGB/CAT
@@ -44,7 +44,7 @@ import xgboost as xgb
 from catboost import CatBoostClassifier
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train import TargetEncoder, TARGET_ENCODE_COLS
+from target_encoding import TargetEncoder, TARGET_ENCODE_COLS
 
 warnings.filterwarnings("ignore")
 
@@ -207,15 +207,14 @@ def search_weights_and_thresholds(
     4. Return best configuration
 
     Returns:
-        best_weights_A, best_weights_B, best_tA, best_tB, best_f1
+        best_weights, best_tA, best_tB, best_f1
     """
     weight_step = 0.2 if fast else 0.1
     thresh_steps = 15 if fast else 30
     thresh_grid = np.linspace(0.05, 0.95, thresh_steps)
 
     best_f1 = 0.0
-    best_weights_A = (0.6, 0.2, 0.2)
-    best_weights_B = (0.6, 0.2, 0.2)
+    best_weights = (0.6, 0.2, 0.2)
     best_tA = 0.5
     best_tB = 0.5
 
@@ -245,12 +244,11 @@ def search_weights_and_thresholds(
                 score = f1_score(y_true, preds, average="weighted")
                 if score > best_f1:
                     best_f1 = score
-                    best_weights_A = (w_lgb, w_xgb, w_cat)
-                    best_weights_B = (w_lgb, w_xgb, w_cat)
+                    best_weights = (w_lgb, w_xgb, w_cat)
                     best_tA = tA
                     best_tB = tB
 
-    return best_weights_A, best_weights_B, best_tA, best_tB, best_f1
+    return best_weights, best_tA, best_tB, best_f1
 
 
 # ── Diagnostics ───────────────────────────────────────────────────────────────
@@ -393,11 +391,11 @@ def run_cv(X, y, country_arr, fast=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast", action="store_true",
-                        help="Use fewer estimators and coarser grid for quick sanity check")
+                        help="Fewer estimators and coarser grid for quick sanity check")
     args = parser.parse_args()
 
     if args.fast:
-        print("*** FAST MODE — for sanity check only, not for submission ***\n")
+        print("*** FAST MODE - for sanity check only, not for submission ***\n")
 
     print("Loading feature data...")
     train = pd.read_csv(PROCESSED_DIR / "train_features.csv")
@@ -425,29 +423,24 @@ def main():
 
     print("\n" + "=" * 60)
     print("Searching optimal weights and thresholds...")
-    (
-        best_weights_A, best_weights_B,
-        best_tA, best_tB, best_f1
-    ) = search_weights_and_thresholds(
+    best_weights, best_tA, best_tB, best_f1 = search_weights_and_thresholds(
         oof_A_lgb, oof_A_xgb, oof_A_cat,
         oof_B_lgb, oof_B_xgb, oof_B_cat,
         y, fast=args.fast
     )
 
-    w_lgb_A, w_xgb_A, w_cat_A = best_weights_A
-    print(f"\nBest weights (A): LGB={w_lgb_A:.2f} XGB={w_xgb_A:.2f} CAT={w_cat_A:.2f}")
+    w_lgb, w_xgb, w_cat = best_weights
+    print(f"\nBest weights: LGB={w_lgb:.2f} XGB={w_xgb:.2f} CAT={w_cat:.2f}")
     print(f"Best tA (>=Medium threshold): {best_tA:.3f}")
     print(f"Best tB (==High threshold):   {best_tB:.3f}")
     print(f"Best OOF weighted F1: {best_f1:.4f}")
 
-    # Final OOF predictions with best config
-    p_A_oof = w_lgb_A * oof_A_lgb + w_xgb_A * oof_A_xgb + w_cat_A * oof_A_cat
-    p_B_oof = w_lgb_A * oof_B_lgb + w_xgb_A * oof_B_xgb + w_cat_A * oof_B_cat
+    p_A_oof = w_lgb * oof_A_lgb + w_xgb * oof_A_xgb + w_cat * oof_A_cat
+    p_B_oof = w_lgb * oof_B_lgb + w_xgb * oof_B_xgb + w_cat * oof_B_cat
     final_preds = ordinal_predict(p_A_oof, p_B_oof, best_tA, best_tB)
 
     print_diagnostics(y, final_preds, country_arr)
 
-    # Fit full-data target encoder for test set
     print("\nFitting full-data target encoder...")
     full_te = TargetEncoder(smoothing=10)
     full_te.fit(X, y, TARGET_ENCODE_COLS)
@@ -463,13 +456,13 @@ def main():
         "feature_cols": feature_cols,
         "target_encode_cols": TARGET_ENCODE_COLS,
         "full_target_encoder": full_te,
-        "best_weights_A": best_weights_A,
-        "best_weights_B": best_weights_B,
+        "best_weights": best_weights,
+        "best_weights_A": best_weights,
+        "best_weights_B": best_weights,
         "best_tA": best_tA,
         "best_tB": best_tB,
         "oof_f1": best_f1,
         "fast_mode": args.fast,
-        # OOF probabilities saved for post-hoc weight search
         "oof_A_lgb": oof_A_lgb,
         "oof_A_xgb": oof_A_xgb,
         "oof_A_cat": oof_A_cat,
@@ -485,7 +478,7 @@ def main():
     print(f"  Saved {out_path}")
     print(f"\nFinal OOF weighted F1: {best_f1:.4f}")
     if args.fast:
-        print("*** FAST MODE result — rerun without --fast before submitting ***")
+        print("*** FAST MODE result - rerun without --fast before submitting ***")
 
 
 if __name__ == "__main__":
