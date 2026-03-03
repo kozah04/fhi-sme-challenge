@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Generated ML outputs
+catboost_info/
+data/processed/
+models/
+backups/
+
+# Submissions: ignore all, keep one canonical file
+submissions/*
+!submissions/submission_ordinal_oof0.8798.csv
